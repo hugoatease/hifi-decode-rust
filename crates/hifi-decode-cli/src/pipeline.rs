@@ -36,10 +36,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use hifi_decode::{
-    cancel_dc_trim, dropout_compensate, headswitch_remove_noise, mix_for_mode_stereo, AfeFilter,
-    AfeOverrides, AfeParams, Block, BlockLayout, BlockResampler, DcBlocker, DecodeMode,
-    DropoutParams, EightMmPostProcess, FmDiscriminator, HeadswitchParams, PostProcessParams,
-    ResamplerQuality, System, TapeFormat, VhsPostProcess,
+    cancel_dc_trim, carrier_bias_khz, classify_calibration, dropout_compensate,
+    headswitch_remove_noise, mix_for_mode_stereo, AfeFilter, AfeOverrides, AfeParams, Block,
+    BlockLayout, BlockResampler, CalibrationQuality, DcBlocker, DecodeMode, DropoutParams,
+    EightMmPostProcess, FmDiscriminator, HeadswitchParams, PostProcessParams, ResamplerQuality,
+    System, TapeFormat, VhsPostProcess,
 };
 use tape_rf_io::DecodeReader;
 
@@ -93,7 +94,7 @@ fn decode_one_block(
     doc_params: Option<&DropoutParams>,
     hs_params: Option<&HeadswitchParams>,
     params: &PipelineParams,
-) -> (Vec<f32>, Vec<f32>) {
+) -> (Vec<f32>, Vec<f32>, f32, f32) {
     let filtered_l = afe_l.work(rf_block);
     let filtered_r = afe_r.work(rf_block);
     let demod_l = disc_l.work(&filtered_l);
@@ -106,12 +107,12 @@ fn decode_one_block(
 
     let trim_l = PRE_TRIM.min(audio_l.len().saturating_sub(1) / 2);
     let trim_r = PRE_TRIM.min(audio_r.len().saturating_sub(1) / 2);
-    if trim_l > 0 {
-        cancel_dc_trim(&mut audio_l, trim_l);
-    }
-    if trim_r > 0 {
-        cancel_dc_trim(&mut audio_r, trim_r);
-    }
+    // Feeds the per-block calibration diagnostic (`log_bias`, called from
+    // `decode`'s ordered-chunk closure) — matches Python's `dcL`/`dcR`
+    // (`HiFiDecode.py:2267-2282`), which also default to 0 when a channel's
+    // demod is skipped.
+    let dc_l = if trim_l > 0 { cancel_dc_trim(&mut audio_l, trim_l) } else { 0.0 };
+    let dc_r = if trim_r > 0 { cancel_dc_trim(&mut audio_r, trim_r) } else { 0.0 };
 
     if let Some(doc_params) = doc_params {
         dropout_compensate(&mut audio_l, &mut audio_r, doc_params, params.mode, params.doc_mode == DocMode::Mute);
@@ -129,10 +130,11 @@ fn decode_one_block(
         audio_r = final_resampler_r.resample(&audio_r);
     }
 
-    mix_for_mode_stereo(&audio_l, &audio_r, params.mode)
+    let (mixed_l, mixed_r) = mix_for_mode_stereo(&audio_l, &audio_r, params.mode);
+    (mixed_l, mixed_r, dc_l, dc_r)
 }
 
-type BlockResult = (usize, Block, Vec<f32>, Vec<f32>);
+type BlockResult = (usize, Block, Vec<f32>, Vec<f32>, f32, f32);
 
 /// Streams RF blocks from `reader` through a worker-thread pool (bounded
 /// by available parallelism), reorders their outputs back into submission
@@ -164,7 +166,7 @@ fn decode_blocks_streaming(
     doc_params: Option<&DropoutParams>,
     hs_params: Option<&HeadswitchParams>,
     params: &PipelineParams,
-    mut on_ordered_chunk: impl FnMut(Vec<f32>, Vec<f32>, &Block) -> Result<()>,
+    mut on_ordered_chunk: impl FnMut(Vec<f32>, Vec<f32>, f32, f32, &Block) -> Result<()>,
 ) -> Result<()> {
     let worker_count = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     // A handful of blocks of slack per worker: enough that a worker never
@@ -187,8 +189,8 @@ fn decode_blocks_streaming(
                 let Ok((index, block, rf_block)) = received else {
                     break;
                 };
-                let (l, r) = decode_one_block(&rf_block, afe_l, afe_r, disc_l, disc_r, doc_params, hs_params, params);
-                if result_tx.send((index, block, l, r)).is_err() {
+                let (l, r, dc_l, dc_r) = decode_one_block(&rf_block, afe_l, afe_r, disc_l, disc_r, doc_params, hs_params, params);
+                if result_tx.send((index, block, l, r, dc_l, dc_r)).is_err() {
                     break;
                 }
             });
@@ -220,18 +222,18 @@ fn decode_blocks_streaming(
         // would otherwise block forever trying to send into channels
         // nobody's receiving from, since `thread::scope` waits for every
         // spawned thread before this function can return.
-        let mut pending: std::collections::HashMap<usize, (Block, Vec<f32>, Vec<f32>)> = std::collections::HashMap::new();
+        let mut pending: std::collections::HashMap<usize, (Block, Vec<f32>, Vec<f32>, f32, f32)> = std::collections::HashMap::new();
         let mut next_expected = 0usize;
-        while let Ok((index, block, l, r)) = result_rx.recv() {
-            pending.insert(index, (block, l, r));
-            while let Some((block, l, r)) = pending.remove(&next_expected) {
+        while let Ok((index, block, l, r, dc_l, dc_r)) = result_rx.recv() {
+            pending.insert(index, (block, l, r, dc_l, dc_r));
+            while let Some((block, l, r, dc_l, dc_r)) = pending.remove(&next_expected) {
                 next_expected += 1;
                 if first_error.is_some() {
                     continue;
                 }
                 let trimmed_l = trim_block_output(&l, &block);
                 let trimmed_r = trim_block_output(&r, &block);
-                if let Err(e) = on_ordered_chunk(trimmed_l, trimmed_r, &block) {
+                if let Err(e) = on_ordered_chunk(trimmed_l, trimmed_r, dc_l, dc_r, &block) {
                     first_error = Some(e);
                 }
             }
@@ -354,6 +356,39 @@ fn format_duration(secs: f64) -> String {
     }
 }
 
+/// `HiFiDecode.log_bias` (`HiFiDecode.py:1506-1525`): reports a block's
+/// measured carrier bias in kHz and whether it implies good, marginal, or
+/// uncalibrated player/recorder tuning. Read-only diagnostic, independent
+/// of `--bias_guess`/`--auto_fine_tune` (carrier auto-tracking, not
+/// ported — see `cli.rs`'s module doc). Called once per ordered chunk
+/// (not from inside a worker) so bias lines stay in block order despite
+/// blocks decoding out-of-order across threads, matching `Progress`.
+fn log_bias(dc_l: f32, dc_r: f32, l_carrier_deviation: f64, r_carrier_deviation: f64, mode: DecodeMode) {
+    // Mono l/r modes only report the channel that's actually in use,
+    // matching Python's `decode_mode == AUDIO_MODE_MONO_L/R` branches —
+    // even though this port always demodulates both channels regardless of
+    // mode (see `decode`'s doc comment on `afe_l`/`afe_r`).
+    let uses_l = mode.uses_left_channel();
+    let uses_r = mode.uses_right_channel();
+    let dev_l = if uses_l { carrier_bias_khz(dc_l, l_carrier_deviation) } else { 0.0 };
+    let dev_r = if uses_r { carrier_bias_khz(dc_r, r_carrier_deviation) } else { 0.0 };
+
+    let bias = match (uses_l, uses_r) {
+        (true, false) => format!("Bias L {dev_l:.2} kHz"),
+        (false, true) => format!("Bias R {dev_r:.2} kHz"),
+        _ => format!("Bias L {dev_l:.2} kHz, R {dev_r:.2} kHz"),
+    };
+
+    match classify_calibration(dev_l, dev_r) {
+        CalibrationQuality::Good => tracing::info!("{bias} (good player/recorder calibration)"),
+        CalibrationQuality::Marginal => tracing::info!("{bias} (maybe marginal player/recorder calibration)"),
+        CalibrationQuality::Uncalibrated => tracing::warn!(
+            "{bias} \u{2014} the player or the recorder may be uncalibrated and/or the standard \
+             and/or the sample rate specified are wrong"
+        ),
+    }
+}
+
 /// The two post-processing chain shapes (`VhsPostProcess`/
 /// `EightMmPostProcess` differ in stage ordering — see their doc
 /// comments), unified so `decode` can hold one chain per channel across
@@ -438,7 +473,9 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
         doc_params.as_ref(),
         hs_params.as_ref(),
         params,
-        |mut pre_l, mut pre_r, block| {
+        |mut pre_l, mut pre_r, dc_l, dc_r, block| {
+            log_bias(dc_l, dc_r, afe_params.l_carrier_deviation, afe_params.r_carrier_deviation, params.mode);
+
             if params.gain != 1.0 {
                 for sample in pre_l.iter_mut().chain(pre_r.iter_mut()) {
                     *sample *= params.gain as f32;

@@ -12,6 +12,14 @@
 //! `--gui`, `--gnuradio`, `--normalize`, `--threads` (this CLI has no
 //! concurrency yet — see `pipeline`'s doc comment), and `.ldf`/`.lds`
 //! input (those delegate to external tools in Python).
+//!
+//! `--bias_guess`/`--auto_fine_tune` cover only the carrier *retuning*
+//! logic (`HiFiDecode.guessBiases`/`auto_fine_tune`, which rebuild the AFE
+//! filters at runtime). The per-block calibration diagnostic those two
+//! share, `HiFiDecode.log_bias` — "good/marginal/uncalibrated
+//! player/recorder calibration" — *is* ported (`pipeline::log_bias`) and
+//! runs unconditionally, with no flag to disable it, matching Python
+//! (which also runs it regardless of `--bias_guess`/`--auto_fine_tune`).
 
 use std::fs::OpenOptions;
 use std::path::PathBuf;

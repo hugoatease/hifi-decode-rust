@@ -3,6 +3,7 @@
 //! `PostProcessor` (Python, in the `vhs-decode` repository).
 
 mod afe;
+mod bias;
 mod block;
 mod demod;
 mod dropout;
@@ -13,6 +14,7 @@ mod resample;
 mod stereo;
 
 pub use afe::{field_rate, AfeFilter, AfeOverrides, AfeParams, System, TapeFormat};
+pub use bias::{carrier_bias_khz, classify_calibration, CalibrationQuality};
 pub use block::{Block, BlockLayout};
 pub use demod::FmDiscriminator;
 pub use dropout::{cancel_dc_trim, dropout_compensate, DropoutParams};
