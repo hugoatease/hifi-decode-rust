@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context as _, Result};
 use clap::{Parser, ValueEnum};
 use hifi_decode::{AfeOverrides, DecodeMode, EnvDetection, PostProcessParams, ResamplerQuality, System, TapeFormat};
-use tape_rf_io::SampleFormat;
+use tape_rf_io::{parse_frequency_mhz, SampleFormat};
 
 use crate::pipeline::{DemodType, DocMode, PipelineParams};
 use crate::writer::AudioSink;
@@ -191,8 +191,8 @@ pub struct Cli {
     /// `<stem>_channel_1<ext>` and `<stem>_channel_2<ext>`.
     outfile: PathBuf,
 
-    /// RF sampling frequency of `infile`. Accepts a bare number (MHz),
-    /// or a value with a hz/khz/mhz suffix.
+    /// RF sampling frequency of `infile`. Accepts a bare number (MHz), or a
+    /// value with a hz/khz/mhz/ghz/fsc/fscpal suffix (e.g. `8fsc`).
     #[arg(long, short = 'f', default_value = "40")]
     frequency: String,
     /// Allow overwriting an existing output file.
@@ -290,23 +290,6 @@ pub struct Cli {
     nr_deemphasis_low_tau: Option<f64>,
     #[arg(long)]
     nr_deemphasis_high_tau: Option<f64>,
-}
-
-/// `parse_frequency` (`main.py:142-149`, and `tape-decode-cli`'s own
-/// equivalent): bare number or hz/khz/mhz-suffixed, returned in MHz.
-fn parse_frequency_mhz(value: &str) -> Result<f64> {
-    let suffix_start = value
-        .find(|ch: char| !matches!(ch, '0'..='9' | '.' | '-' | '+' | 'e' | 'E'))
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(suffix_start);
-    let base: f64 = number.parse().context("invalid frequency value")?;
-    let multiplier = match suffix.to_ascii_lowercase().as_str() {
-        "" | "m" | "mhz" => 1.0,
-        "k" | "khz" => 1.0e-3,
-        "hz" => 1.0e-6,
-        other => bail!("unknown frequency suffix: {other}"),
-    };
-    Ok(base * multiplier)
 }
 
 pub fn run_cli() -> Result<()> {
