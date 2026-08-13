@@ -355,7 +355,17 @@ pub fn run_cli() -> Result<()> {
     };
 
     let params = PipelineParams {
-        input_rate: frequency_mhz * 1.0e6,
+        // Truncated to a whole Hz, matching `HiFiDecode.__init__`'s
+        // `self.input_rate: int = int(options["input_rate"])`
+        // (`HiFiDecode.py:1104`). This is not cosmetic: the truncated rate
+        // is what every downstream stage is derived from — the AFE and FM
+        // discriminator (both built against `if_rate`, which *is*
+        // `input_rate` on the quadrature path), the block sizing, and the
+        // resampling ratios — so keeping the exact fractional rate here
+        // would put every one of them fractionally out of step with the
+        // reference. `8fsc` is the case that bites: 28636363.63... Hz
+        // truncates to 28636363 Hz.
+        input_rate: (frequency_mhz * 1.0e6).trunc(),
         format,
         system,
         afe_overrides,

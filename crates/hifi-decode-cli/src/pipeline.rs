@@ -40,7 +40,7 @@ use hifi_decode::{
     headswitch_remove_noise, mix_for_mode_stereo, AfeFilter, AfeOverrides, AfeParams, Block,
     BlockLayout, BlockResampler, CalibrationQuality, DcBlocker, DecodeMode, DropoutParams,
     EightMmPostProcess, FmDiscriminator, HeadswitchParams, PostProcessParams, ResamplerQuality,
-    System, TapeFormat, VhsPostProcess,
+    ResamplerStage, System, TapeFormat, VhsPostProcess,
 };
 use tape_rf_io::DecodeReader;
 
@@ -48,6 +48,14 @@ use crate::stream::StreamingBlocks;
 
 const AUDIO_RATE_INTERMEDIATE: f64 = 192_000.0;
 const PRE_TRIM: usize = 1000;
+
+/// Python's `round()` — half-to-even. `block_audio_final_overlap` is odd
+/// on an 8fsc capture (263), so halving it lands exactly on `.5` and the
+/// tie-breaking rule decides whether the output starts 131 or 132 samples
+/// late.
+fn py_round_ties_even(x: f64) -> f64 {
+    x.round_ties_even()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DemodType {
@@ -100,8 +108,8 @@ fn decode_one_block(
     let demod_l = disc_l.work(&filtered_l);
     let demod_r = disc_r.work(&filtered_r);
 
-    let audio_resampler_l = BlockResampler::new(params.input_rate, AUDIO_RATE_INTERMEDIATE, params.resampler_quality);
-    let audio_resampler_r = BlockResampler::new(params.input_rate, AUDIO_RATE_INTERMEDIATE, params.resampler_quality);
+    let audio_resampler_l = BlockResampler::new(params.input_rate, AUDIO_RATE_INTERMEDIATE, params.resampler_quality, ResamplerStage::Audio);
+    let audio_resampler_r = BlockResampler::new(params.input_rate, AUDIO_RATE_INTERMEDIATE, params.resampler_quality, ResamplerStage::Audio);
     let mut audio_l = audio_resampler_l.resample(&demod_l);
     let mut audio_r = audio_resampler_r.resample(&demod_r);
 
@@ -123,8 +131,8 @@ fn decode_one_block(
         None => (audio_l, audio_r),
     };
 
-    let final_resampler_l = BlockResampler::new(AUDIO_RATE_INTERMEDIATE, params.audio_final_rate, params.resampler_quality);
-    let final_resampler_r = BlockResampler::new(AUDIO_RATE_INTERMEDIATE, params.audio_final_rate, params.resampler_quality);
+    let final_resampler_l = BlockResampler::new(AUDIO_RATE_INTERMEDIATE, params.audio_final_rate, params.resampler_quality, ResamplerStage::AudioFinal);
+    let final_resampler_r = BlockResampler::new(AUDIO_RATE_INTERMEDIATE, params.audio_final_rate, params.resampler_quality, ResamplerStage::AudioFinal);
     if AUDIO_RATE_INTERMEDIATE != params.audio_final_rate {
         audio_l = final_resampler_l.resample(&audio_l);
         audio_r = final_resampler_r.resample(&audio_r);
@@ -260,9 +268,7 @@ fn decode_blocks_streaming(
 }
 
 fn trim_block_output(block_output: &[f32], block: &Block) -> Vec<f32> {
-    let len = block_output.len();
-    let skip = block.output_skip.min(len);
-    let take = block.output_take.min(len - skip);
+    let (skip, take) = block.output_span(block_output.len());
     block_output[skip..skip + take].to_vec()
 }
 
@@ -550,6 +556,21 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
     let mut progress = Progress::new(reader.total_samples(), params.audio_final_rate, params.input_rate);
     let mut bias_log = BiasLog::new();
 
+    // Python opens the output with a run of silence to make up for the gap
+    // block 0's faked left overlap leaves at the very start
+    // (`main.py:1288-1296`). It expresses the amount as a *byte* count —
+    // `round(block_audio_final_overlap / 2) * 2 * 4` — and writes that same
+    // byte count to each file. On the interleaved-stereo path those bytes
+    // are one buffer of stereo frames; on the dual-mono path the identical
+    // count goes to each mono file, where it buys twice as many frames per
+    // channel. Reproduced verbatim, oddity included, because it shifts
+    // every subsequent sample.
+    let mut leading_silence = py_round_ties_even(layout.block_audio_final_overlap as f64 / 2.0) as usize;
+    if matches!(params.mode, DecodeMode::DualMono | DecodeMode::DualMonoMs) {
+        leading_silence *= 2;
+    }
+    let mut silence_pending = true;
+
     decode_blocks_streaming(
         reader,
         &layout,
@@ -589,6 +610,14 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
             chain_r.process(&mut pre_r, &mut post_r, prime_len);
 
             progress.record(post_l.len(), block.read_end);
+            if silence_pending {
+                silence_pending = false;
+                let mut padded_l = vec![0.0f32; leading_silence];
+                let mut padded_r = vec![0.0f32; leading_silence];
+                padded_l.extend_from_slice(&post_l);
+                padded_r.extend_from_slice(&post_r);
+                return on_chunk(&padded_l, &padded_r);
+            }
             on_chunk(&post_l, &post_r)
         },
     )?;

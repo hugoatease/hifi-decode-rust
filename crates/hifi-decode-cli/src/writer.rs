@@ -20,12 +20,44 @@ use flacenc::component::{BitRepr, Stream, StreamInfo};
 use flacenc::error::{Verified, Verify};
 use flacenc::source::{Context as Md5Context, Fill, FrameBuf};
 
+/// Float-to-integer sample conversion, reproducing libsndfile's
+/// (`src/flac.c`'s `f2flac24_clip_array`, `src/float32.c`'s
+/// `f2s_clip_array`), which is what Python's output goes through via
+/// `soundfile`.
+///
+/// Three details each matter to the last bit, and none of them is the
+/// obvious choice:
+///  * the scale factor is a *power of two* — `2^23` for 24-bit, `2^15` for
+///    16-bit — not the largest representable magnitude (`2^23 - 1`), so
+///    full-scale input overshoots and is caught by the clip below rather
+///    than landing exactly on the maximum;
+///  * rounding is `lrintf`, i.e. **half-to-even** under the default FP
+///    rounding mode, not half-away-from-zero like Rust's `f32::round`;
+///  * the multiply happens in `f32`, so it carries `f32` rounding before
+///    the tie-break even sees the value.
+///
+/// Getting any of these wrong shifts a large share of samples by one LSB —
+/// inaudible, but enough to make the output differ from the reference.
 fn f32_to_i16(v: f32) -> i32 {
-    (v.clamp(-1.0, 1.0) * 32767.0).round() as i32
+    let scaled = v * 32_768.0f32;
+    if scaled >= 32_767.0 {
+        32_767
+    } else if scaled <= -32_768.0 {
+        -32_768
+    } else {
+        scaled.round_ties_even() as i32
+    }
 }
 
 fn f32_to_i24(v: f32) -> i32 {
-    (v.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32
+    let scaled = v * 8_388_608.0f32;
+    if scaled >= 8_388_607.0 {
+        8_388_607
+    } else if scaled <= -8_388_608.0 {
+        -8_388_608
+    } else {
+        scaled.round_ties_even() as i32
+    }
 }
 
 fn interleave(left: &[f32], right: Option<&[f32]>, widen: impl Fn(f32) -> i32) -> Vec<i32> {
