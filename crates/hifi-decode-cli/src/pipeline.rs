@@ -407,9 +407,10 @@ fn format_duration(secs: f64) -> String {
 /// measured carrier bias in kHz and whether it implies good, marginal, or
 /// uncalibrated player/recorder tuning. Read-only diagnostic, independent
 /// of `--bias_guess`/`--auto_fine_tune` (carrier auto-tracking, not
-/// ported — see `cli.rs`'s module doc). Called once per ordered chunk
-/// (not from inside a worker) so bias lines stay in block order despite
-/// blocks decoding out-of-order across threads, matching `Progress`.
+/// ported — see `cli.rs`'s module doc). Called from `BiasLog::record`,
+/// itself called once per ordered chunk (not from inside a worker) so
+/// bias lines stay in block order despite blocks decoding out-of-order
+/// across threads, matching `Progress`.
 fn log_bias(dc_l: f32, dc_r: f32, l_carrier_deviation: f64, r_carrier_deviation: f64, mode: DecodeMode) {
     // Mono l/r modes only report the channel that's actually in use,
     // matching Python's `decode_mode == AUDIO_MODE_MONO_L/R` branches —
@@ -433,6 +434,33 @@ fn log_bias(dc_l: f32, dc_r: f32, l_carrier_deviation: f64, r_carrier_deviation:
             "{bias} \u{2014} the player or the recorder may be uncalibrated and/or the standard \
              and/or the sample rate specified are wrong"
         ),
+    }
+}
+
+/// Throttles `log_bias` to at most once per `PROGRESS_LOG_INTERVAL`, the
+/// same cadence `Progress` logs at. Python logs it on every block
+/// unconditionally, but that's roughly two lines per second of input on a
+/// real, many-thousand-block capture — noisy enough in practice to bury
+/// everything else in the log, so this port trades Python's per-block
+/// parity for a periodic sample instead.
+struct BiasLog {
+    last_log: Instant,
+    logged_once: bool,
+}
+
+impl BiasLog {
+    fn new() -> Self {
+        BiasLog { last_log: Instant::now(), logged_once: false }
+    }
+
+    fn record(&mut self, dc_l: f32, dc_r: f32, l_carrier_deviation: f64, r_carrier_deviation: f64, mode: DecodeMode) {
+        let now = Instant::now();
+        if self.logged_once && now.duration_since(self.last_log) < PROGRESS_LOG_INTERVAL {
+            return;
+        }
+        self.last_log = now;
+        self.logged_once = true;
+        log_bias(dc_l, dc_r, l_carrier_deviation, r_carrier_deviation, mode);
     }
 }
 
@@ -509,6 +537,7 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
     let mut chain_r = PostChain::new(params.format, params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
     let mut is_first_chunk = true;
     let mut progress = Progress::new(reader.total_samples(), params.audio_final_rate, params.input_rate);
+    let mut bias_log = BiasLog::new();
 
     decode_blocks_streaming(
         reader,
@@ -521,7 +550,7 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
         hs_params.as_ref(),
         params,
         |mut pre_l, mut pre_r, dc_l, dc_r, block| {
-            log_bias(dc_l, dc_r, afe_params.l_carrier_deviation, afe_params.r_carrier_deviation, params.mode);
+            bias_log.record(dc_l, dc_r, afe_params.l_carrier_deviation, afe_params.r_carrier_deviation, params.mode);
 
             if params.gain != 1.0 {
                 for sample in pre_l.iter_mut().chain(pre_r.iter_mut()) {

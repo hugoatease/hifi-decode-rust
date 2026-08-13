@@ -15,11 +15,14 @@
 //!
 //! `--bias_guess`/`--auto_fine_tune` cover only the carrier *retuning*
 //! logic (`HiFiDecode.guessBiases`/`auto_fine_tune`, which rebuild the AFE
-//! filters at runtime). The per-block calibration diagnostic those two
-//! share, `HiFiDecode.log_bias` — "good/marginal/uncalibrated
-//! player/recorder calibration" — *is* ported (`pipeline::log_bias`) and
-//! runs unconditionally, with no flag to disable it, matching Python
-//! (which also runs it regardless of `--bias_guess`/`--auto_fine_tune`).
+//! filters at runtime). The calibration diagnostic those two share,
+//! `HiFiDecode.log_bias` — "good/marginal/uncalibrated player/recorder
+//! calibration" — *is* ported (`pipeline::log_bias`) and runs
+//! unconditionally, with no flag to disable it, independent of
+//! `--bias_guess`/`--auto_fine_tune` like in Python. Unlike Python, it's
+//! throttled to `Progress`'s cadence rather than logged on every block
+//! (`pipeline::BiasLog`) — matching Python's per-block volume proved too
+//! noisy on real, many-thousand-block captures to be useful.
 
 use std::fs::OpenOptions;
 use std::path::PathBuf;
