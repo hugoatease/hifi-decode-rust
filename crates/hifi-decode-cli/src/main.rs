@@ -1,5 +1,6 @@
 mod cli;
 mod pipeline;
+mod sndfile;
 mod stream;
 mod writer;
 
