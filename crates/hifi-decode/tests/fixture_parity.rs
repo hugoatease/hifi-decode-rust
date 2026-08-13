@@ -7,7 +7,8 @@ mod support;
 
 use hifi_decode::{
     cancel_dc_trim, carrier_bias_khz, dropout_compensate, mix_for_mode_stereo, AfeFilter,
-    AfeOverrides, AfeParams, DecodeMode, DropoutParams, FmDiscriminator, System, TapeFormat,
+    AfeOverrides, AfeParams, BlockResampler, DecodeMode, DropoutParams, FmDiscriminator,
+    ResamplerQuality, ResamplerStage, System, TapeFormat,
 };
 
 const FS: f64 = 8_000_000.0;
@@ -86,6 +87,28 @@ fn quadrature_demod_matches_python() {
     let diff_r = max_abs_diff(&got_r[..n], &expected_r[..n]);
     assert!(diff_l < 1e-2, "L channel max abs diff {diff_l}");
     assert!(diff_r < 1e-2, "R channel max abs diff {diff_r}");
+}
+
+/// The demod -> 192kHz resample, the stage that used to be a pure-Rust
+/// approximation of soxr. Now that it binds libsoxr and reproduces
+/// Python's `Fraction`-derived rate pair, it should reproduce
+/// `03_resampled_*.npy` exactly rather than approximately — including the
+/// output length, which the old resampler also got wrong.
+#[test]
+fn audio_resample_matches_python() {
+    let demod_l = support::load_f32(fixture_path("02_demod_l.npy"));
+    let demod_r = support::load_f32(fixture_path("02_demod_r.npy"));
+    let expected_l = support::load_f32(fixture_path("03_resampled_l.npy"));
+    let expected_r = support::load_f32(fixture_path("03_resampled_r.npy"));
+
+    let resampler = BlockResampler::new(FS, AUDIO_RATE, ResamplerQuality::High, ResamplerStage::Audio);
+    let got_l = resampler.resample(&demod_l);
+    let got_r = resampler.resample(&demod_r);
+
+    assert_eq!(got_l.len(), expected_l.len(), "L resampled length");
+    assert_eq!(got_r.len(), expected_r.len(), "R resampled length");
+    assert_eq!(got_l, expected_l, "L channel is not bit-identical to soxr's output");
+    assert_eq!(got_r, expected_r, "R channel is not bit-identical to soxr's output");
 }
 
 #[test]

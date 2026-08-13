@@ -8,6 +8,50 @@ use realfft::{RealFftPlanner, RealToComplex};
 
 use crate::stereo::DecodeMode;
 
+/// The `f32` sum `numba` produces for `np.mean` under `fastmath=True`.
+///
+/// Summation order changes the result, and the reference is not a plain
+/// left-to-right loop: `fastmath` lets LLVM reassociate, and it vectorises
+/// the reduction into **four** NEON `f32x4` accumulators (16 values in
+/// flight), folds those four together as a balanced tree, reduces the four
+/// lanes as another balanced tree, and finishes the ragged tail
+/// sequentially. Summing in `f64` instead — the obvious "more accurate"
+/// choice, and what this port did before — lands one ULP away, which is
+/// enough to shift output samples by an LSB.
+///
+/// This shape was recovered by searching reduction orders against DC
+/// values `HiFiDecode.cancelDC_trim` actually produced, and it is
+/// **aarch64-specific**: the same `numba` on x86-64 vectorises to a
+/// different width, so the reference's own output differs by an ULP across
+/// architectures. Bit-exactness is therefore only meaningful against a
+/// reference run on the same architecture.
+fn numba_fastmath_sum(values: &[f32]) -> f32 {
+    const LANES: usize = 4;
+    const ACCUMULATORS: usize = 4;
+    const STEP: usize = LANES * ACCUMULATORS;
+
+    let mut acc = [[0.0f32; LANES]; ACCUMULATORS];
+    let vectorized = values.len() - values.len() % STEP;
+    for chunk in values[..vectorized].chunks_exact(STEP) {
+        for (a, part) in acc.iter_mut().zip(chunk.chunks_exact(LANES)) {
+            for (slot, &value) in a.iter_mut().zip(part) {
+                *slot += value;
+            }
+        }
+    }
+
+    let mut folded = [0.0f32; LANES];
+    for lane in 0..LANES {
+        folded[lane] = (acc[0][lane] + acc[1][lane]) + (acc[2][lane] + acc[3][lane]);
+    }
+    let mut total = (folded[0] + folded[1]) + (folded[2] + folded[3]);
+
+    for &value in &values[vectorized..] {
+        total += value;
+    }
+    total
+}
+
 /// `cancelDC_trim` (`HiFiDecode.py:1857-1869`): subtract the mean over
 /// `[trim, len-trim)` from that same range in place, and zero the `trim`
 /// samples on each edge. Returns the DC value subtracted (feeds
@@ -17,8 +61,7 @@ pub fn cancel_dc_trim(audio: &mut [f32], trim: usize) -> f32 {
     assert!(trim * 2 < n, "trim window covers the whole buffer");
 
     let inner = &audio[trim..n - trim];
-    let dc = inner.iter().map(|&v| v as f64).sum::<f64>() / inner.len() as f64;
-    let dc = dc as f32;
+    let dc = numba_fastmath_sum(inner) / inner.len() as f32;
 
     for sample in &mut audio[trim..n - trim] {
         *sample -= dc;
