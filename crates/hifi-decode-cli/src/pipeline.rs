@@ -282,19 +282,23 @@ struct Progress {
     last_log: Instant,
     total_input_samples: Option<u64>,
     audio_final_rate: f64,
+    input_rate: f64,
     decoded_samples: u64,
+    last_read_end: usize,
     logged_once: bool,
 }
 
 impl Progress {
-    fn new(total_input_samples: Option<u64>, audio_final_rate: f64) -> Self {
+    fn new(total_input_samples: Option<u64>, audio_final_rate: f64, input_rate: f64) -> Self {
         let now = Instant::now();
         Progress {
             start: now,
             last_log: now,
             total_input_samples,
             audio_final_rate,
+            input_rate,
             decoded_samples: 0,
+            last_read_end: 0,
             logged_once: false,
         }
     }
@@ -307,6 +311,36 @@ impl Progress {
     /// audio exists so far, used for the realtime-multiplier figure).
     fn record(&mut self, chunk_len: usize, read_end: usize) {
         self.decoded_samples += chunk_len as u64;
+        self.last_read_end = read_end;
+
+        // A declared total can be wrong in the too-small direction — e.g.
+        // a FLAC capture whose STREAMINFO total-samples was written from a
+        // planned/target recording length that the real capture ran past
+        // (piped encoders can't rewind and fix the header once more data
+        // than expected shows up), or a file cut/trimmed out of a larger
+        // original without re-encoding (e.g. `ffmpeg -c copy`), whose
+        // STREAMINFO still describes the source it was cut from rather
+        // than the trimmed content. Reaching the declared total exactly is
+        // the normal, expected way every successful decode ends (the last
+        // block's `read_end` lands exactly on it), so only *exceeding* it
+        // is proof of a bad total — clamping the percentage at 100% while
+        // decoding keeps going for a long time afterwards (with `ETA 0s`
+        // — see `log`'s clamp) is more misleading than just admitting the
+        // total isn't known, which is the same fallback already used for
+        // unseekable pipes (`total_input_samples: None`).
+        if let Some(total) = self.total_input_samples {
+            if read_end as u64 > total {
+                tracing::warn!(
+                    "input's declared sample count ({total}) is smaller than the amount already \
+                     read ({read_end}) — the input's own metadata undercounts its real length \
+                     (e.g. a capture that ran past a pre-declared/target size, or a file cut from \
+                     a larger original without re-encoding); disabling percentage/ETA reporting \
+                     for the rest of this run"
+                );
+                self.total_input_samples = None;
+            }
+        }
+
         let now = Instant::now();
         if self.logged_once && now.duration_since(self.last_log) < PROGRESS_LOG_INTERVAL {
             return;
@@ -331,7 +365,20 @@ impl Progress {
                 );
             }
             _ => {
-                tracing::info!("decoded {decoded_secs:.1}s of audio so far in {elapsed:.1}s ({realtime_x:.2}x realtime)");
+                // No trustworthy total to derive a percentage/ETA from
+                // (an unseekable pipe, or an input whose declared length
+                // has been disproven by `record` — see its doc comment).
+                // Report the input-domain read position instead, mirroring
+                // `HiFiDecode`'s own `log_decode` (`main.py:1036-1064`,
+                // "Input position"), which never relies on a declared
+                // total in the first place: it's derived purely from
+                // `read_end`/`input_rate`, so it stays meaningful however
+                // the total turned out.
+                let input_position_secs = read_end as f64 / self.input_rate;
+                tracing::info!(
+                    "decoded {decoded_secs:.1}s of audio so far (input position {input_position_secs:.1}s) \
+                     in {elapsed:.1}s ({realtime_x:.2}x realtime)"
+                );
             }
         }
     }
@@ -340,7 +387,7 @@ impl Progress {
     /// interval, so a run that finishes faster than `PROGRESS_LOG_INTERVAL`
     /// still gets a final status line instead of total silence.
     fn finish(&self) {
-        self.log(Instant::now(), self.total_input_samples.unwrap_or(0) as usize);
+        self.log(Instant::now(), self.last_read_end);
     }
 }
 
@@ -461,7 +508,7 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
     let mut chain_l = PostChain::new(params.format, params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
     let mut chain_r = PostChain::new(params.format, params.audio_final_rate, params.post_process, params.enable_deemphasis, params.enable_expander);
     let mut is_first_chunk = true;
-    let mut progress = Progress::new(reader.total_samples(), params.audio_final_rate);
+    let mut progress = Progress::new(reader.total_samples(), params.audio_final_rate, params.input_rate);
 
     decode_blocks_streaming(
         reader,
