@@ -353,13 +353,14 @@ impl Progress {
     fn log(&self, now: Instant, read_end: usize) {
         let elapsed = now.duration_since(self.start).as_secs_f64();
         let decoded_secs = self.decoded_samples as f64 / self.audio_final_rate;
+        let decoded_hms = format_hms(decoded_secs);
         let realtime_x = if elapsed > 0.0 { decoded_secs / elapsed } else { 0.0 };
         match self.total_input_samples {
             Some(total) if total > 0 => {
                 let pct = (read_end as f64 / total as f64 * 100.0).clamp(0.0, 100.0);
                 let eta_secs = if pct > 0.1 { elapsed * (100.0 - pct) / pct } else { f64::NAN };
                 tracing::info!(
-                    "decoded {decoded_secs:.1}s of audio so far ({pct:.1}% of input, ETA {eta}) \
+                    "decoded {decoded_secs:.1}s of audio so far ({decoded_hms}) ({pct:.1}% of input, ETA {eta}) \
                      in {elapsed:.1}s ({realtime_x:.2}x realtime)",
                     eta = format_duration(eta_secs),
                 );
@@ -376,7 +377,7 @@ impl Progress {
                 // the total turned out.
                 let input_position_secs = read_end as f64 / self.input_rate;
                 tracing::info!(
-                    "decoded {decoded_secs:.1}s of audio so far (input position {input_position_secs:.1}s) \
+                    "decoded {decoded_secs:.1}s of audio so far ({decoded_hms}) (input position {input_position_secs:.1}s) \
                      in {elapsed:.1}s ({realtime_x:.2}x realtime)"
                 );
             }
@@ -401,6 +402,16 @@ fn format_duration(secs: f64) -> String {
     } else {
         format!("{}m{:02}s", secs / 60, secs % 60)
     }
+}
+
+/// Zero-padded `HH:MM:SS` timestamp for an absolute duration/position, as
+/// opposed to `format_duration`'s compact relative-duration style (used for
+/// ETA) — easier to read at a glance on a long capture than a raw seconds
+/// count (e.g. `00:23:29` vs `1409.0s`).
+fn format_hms(secs: f64) -> String {
+    let secs = secs.max(0.0).round() as u64;
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    format!("{h:02}:{m:02}:{s:02}")
 }
 
 /// `HiFiDecode.log_bias` (`HiFiDecode.py:1506-1525`): reports a block's
