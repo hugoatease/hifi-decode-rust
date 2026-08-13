@@ -230,7 +230,13 @@ impl Expander {
 
         if self.use_rms {
             for sc in side_chain.iter_mut() {
-                let sc_sq = (*sc as f64) * (*sc as f64);
+                // Squared in `f32`, then widened — not widened and squared
+                // in `f64`. `side_chain` is a float32 array on the Python
+                // side, so `sc * sc` is a float32 multiply there
+                // (`HiFiDecode.py:981`) and rounds before anything else
+                // sees it; doing the multiply in f64 keeps precision the
+                // reference threw away and drifts the envelope from it.
+                let sc_sq = (*sc * *sc) as f64;
                 if sc_sq > env_lin {
                     env_lin = self.atk_coeff * env_lin + one_minus_atk * sc_sq;
                     hold_state = self.hold_samples;

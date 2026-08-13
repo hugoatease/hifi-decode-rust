@@ -590,6 +590,17 @@ pub fn decode(reader: &mut DecodeReader, params: &PipelineParams, mut on_chunk: 
                 }
             }
 
+            // The DC blocker gets primed on block 0 the same way the
+            // expander does: run once over a throwaway copy so its three
+            // cascaded one-pole stages settle, then run for real
+            // (`PostProcessor.py:280-284`). Without this the first block
+            // carries the filter's cold-start transient, which is both
+            // audible as a thump and enough to shift a long stretch of
+            // samples away from the reference.
+            if is_first_chunk {
+                dc_blocker_l.process(&mut pre_l.clone());
+                dc_blocker_r.process(&mut pre_r.clone());
+            }
             dc_blocker_l.process(&mut pre_l);
             dc_blocker_r.process(&mut pre_r);
 
