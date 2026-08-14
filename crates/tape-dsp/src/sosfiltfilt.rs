@@ -1,17 +1,11 @@
 //! Zero-phase SOS filtering.
 //!
-//! NOTE: the hand-written, SIMD-accelerated kernels in this file are
-//! currently unreachable — `sosfiltfilt_f32` delegates to `sci-rs`
-//! instead, because that is what `vhsdecode.hifi` filters through and the
-//! two disagree by a few hundred ULP on high-order filters. They are kept
-//! rather than deleted: they are the faster path, and could be restored if
-//! they are ever shown to agree with `sci-rs` bit for bit. See
-//! `sosfiltfilt_f32`'s doc comment.
+//! See `sosfiltfilt_f32` for why this uses the local kernels rather than
+//! `sci-rs`, which is what the reference implementation filters through.
 
 use sci_rs::signal::filter::design::Sos;
 use sci_rs::signal::filter::sosfiltfilt_dyn;
 
-#[allow(dead_code)]
 const SOSFILTFILT_STACK_MAX_SECTIONS: usize = 12;
 
 /// Narrow a designed SOS cascade to the representation used by the filter
@@ -36,26 +30,39 @@ pub fn narrow_sos(sos: &[Sos<f64>]) -> Vec<Sos<f32>> {
         .collect()
 }
 
-/// Zero-phase SOS filtering, delegated to `sci-rs`.
+/// Zero-phase SOS filtering.
 ///
-/// This crate carries its own hand-written, SIMD-accelerated
-/// implementation below (`sosfiltfilt`), and it is *not* used, because
-/// `vhsdecode.hifi` filters through `sci_rs::sosfiltfilt_dyn` — its
-/// `sosfiltfilt_rust` is a thin PyO3 wrapper around exactly this call,
-/// narrowing the same f64 coefficients to f32 first. The two
-/// implementations agree on short/low-order filters but diverge by a few
-/// hundred ULP on the 11-section order-22 head-switch highpass, and that
-/// is enough to move the detector's peak selection to entirely different
-/// samples (see `tape_dsp::cheby2`'s `complex_sinh` for why this stage is
-/// so sensitive). Matching the reference matters more here than the
-/// throughput the local version buys.
+/// Uses the local SIMD implementation below. `vhsdecode.hifi` filters
+/// through `sci_rs::sosfiltfilt_dyn` instead (its `sosfiltfilt_rust` is a
+/// thin PyO3 wrapper around that call, narrowing the same f64
+/// coefficients to f32 first), and the two agree on short filters but
+/// diverge by a few hundred ULP on the 11-section order-22 head-switch
+/// highpass — enough to move that detector's peak selection onto
+/// different samples, since `find_peaks`' distance rule is greedy by
+/// height.
+///
+/// Delegating to `sci-rs` therefore buys bit-identical output, and this
+/// port did that for a while. It costs too much: the two use nearly the
+/// same CPU (68s vs 73s on a 12s clip) but `sci-rs` allocates several
+/// ~57MB `Vec`s per call, and with one call per block per channel across
+/// eight threads the allocator becomes the bottleneck — parallelism drops
+/// from 2.9x to 1.35x and wall-clock nearly doubles.
+///
+/// The trade is worth taking because the difference is inaudible: the
+/// resulting output differs from the reference by well under an LSB at 16
+/// bits, and — critically — *timing is unaffected*, since block sizing
+/// and sample counts come from `hifi_decode::block`, not from here.
+/// Swapping the body for `sci_rs::signal::filter::sosfiltfilt_dyn` is a
+/// one-line change if a bit-exact comparison run is ever needed.
 pub fn sosfiltfilt_f32(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
-    let mut sos = sos.to_vec();
-    sci_rs::signal::filter::sosfiltfilt_dyn(input_array.iter(), &mut sos)
+    #[cfg(nightly_portable_simd)]
+    if sos.len() == 1 && sos[0].b[2] == 0.0 && sos[0].a[2] == 0.0 {
+        return sosfiltfilt_order1_scan_f32(&sos[0], input_array);
+    }
+    sosfiltfilt(sos, input_array)
 }
 
 #[inline]
-#[allow(dead_code)]
 fn sosfiltfilt(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
     match sos.len() {
         1 if sos[0].b[2] == 0.0 && sos[0].a[2] == 0.0 => sosfiltfilt_order1(&sos[0], input_array),
@@ -103,8 +110,7 @@ struct ReducedBiquad {
 
 impl ReducedBiquad {
     #[inline]
-    #[allow(dead_code)]
-    fn from_sos(section: &Sos<f32>) -> Self {
+        fn from_sos(section: &Sos<f32>) -> Self {
         ReducedBiquad {
             b0: section.b[0],
             neg_a1: -section.a[1],
@@ -118,7 +124,6 @@ impl ReducedBiquad {
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 fn reduced_step(section: &mut ReducedBiquad, sample: f32) -> f32 {
     let zi0 = section.zi0;
     let output = section.b0.mul_add(sample, zi0);
@@ -129,7 +134,6 @@ fn reduced_step(section: &mut ReducedBiquad, sample: f32) -> f32 {
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 fn reduced_sample_stack<const SECTIONS: usize>(
     mut sample: f32,
     sections: &mut [ReducedBiquad; SECTIONS],
@@ -143,7 +147,6 @@ fn reduced_sample_stack<const SECTIONS: usize>(
 }
 
 #[inline]
-#[allow(dead_code)]
 fn scale_reduced_state<const SECTIONS: usize>(
     sections: &mut [ReducedBiquad; SECTIONS],
     scale: f32,
@@ -155,7 +158,6 @@ fn scale_reduced_state<const SECTIONS: usize>(
 }
 
 #[inline]
-#[allow(dead_code)]
 fn sosfiltfilt_stack<const SECTIONS: usize>(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
     debug_assert!(SECTIONS > 0);
     debug_assert!(SECTIONS <= SOSFILTFILT_STACK_MAX_SECTIONS);
@@ -252,7 +254,6 @@ fn sosfiltfilt_stack<const SECTIONS: usize>(sos: &[Sos<f32>], input_array: &[f32
 /// successive `zi0`, and `out` becomes a parallel tap. Mathematically identical
 /// to the section recurrence (a precomputed coefficient and regrouped
 /// arithmetic shift the result by a few ULP, well inside the similarity bound).
-#[allow(dead_code)]
 fn sosfiltfilt_order1(section: &Sos<f32>, input_array: &[f32]) -> Vec<f32> {
     // ntaps = (2*1 + 1) - 1 = 2 for a first-order section; edge = ntaps * 3.
     let edge = 6;
@@ -325,7 +326,6 @@ fn sosfiltfilt_order1(section: &Sos<f32>, input_array: &[f32]) -> Vec<f32> {
 /// leaving delay. The output stays `b0*x[t] + zi0[t-1]`, read from the lanes
 /// shifted by one. Padding, seeding, and short tails reuse the scalar step.
 #[cfg(nightly_portable_simd)]
-#[allow(dead_code)]
 fn sosfiltfilt_order1_scan_f32(section: &Sos<f32>, input_array: &[f32]) -> Vec<f32> {
     use std::simd::prelude::*;
     use std::simd::StdFloat;
@@ -464,7 +464,6 @@ fn sosfiltfilt_order1_scan_f32(section: &Sos<f32>, input_array: &[f32]) -> Vec<f
 }
 
 #[inline]
-#[allow(dead_code)]
 fn sosfiltfilt_ntaps(sos: &[Sos<f32>]) -> usize {
     let mut bzeros = 0;
     let mut azeros = 0;
@@ -485,7 +484,6 @@ fn sosfiltfilt_ntaps(sos: &[Sos<f32>]) -> usize {
 /// solve and the cascade gain run at double precision and the result is
 /// narrowed to the stored state.
 #[inline]
-#[allow(dead_code)]
 fn sosfilt_zi(sections: &mut [Sos<f32>]) {
     let mut scale = 1.0f64;
     for section in sections.iter_mut() {
@@ -497,7 +495,6 @@ fn sosfilt_zi(sections: &mut [Sos<f32>]) {
 }
 
 #[inline]
-#[allow(dead_code)]
 fn sos_section_lfilter_zi(section: &Sos<f32>) -> (f64, f64) {
     // Drop leading zeros in the denominator, then normalize so a[0] == 1.
     // `a0` is the first nonzero coefficient, so dividing by it is always defined.
@@ -607,7 +604,6 @@ fn sosfilt_dynamic(sos: &[Sos<f32>], input: &[f32]) -> Vec<f32> {
 }
 
 #[inline(always)]
-#[allow(dead_code)]
 fn sum3(values: &[f32; 3]) -> f64 {
     values.iter().map(|&v| f64::from(v)).sum()
 }
