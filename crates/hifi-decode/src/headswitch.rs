@@ -8,7 +8,7 @@
 use sci_rs::signal::filter::design::{FilterBandType, Sos};
 use tape_dsp::{cheby2_sos, narrow_sos, sosfiltfilt_f32};
 
-use crate::dropout::{mean_stddev, merge_boundaries};
+use crate::dropout::{mean, mean_stddev, merge_boundaries};
 use crate::find_peaks::{find_peaks, FindPeaksOptions};
 
 /// Fixed constants from `HiFiDecode.__init__` (`:1161-1187`), independent
@@ -156,8 +156,9 @@ fn smooth(data_in: &[f32], half_window: usize) -> Vec<f32> {
         .map(|i| {
             let start = i.saturating_sub(half_window);
             let end = (i + half_window + 1).min(n);
-            let slice = &data_in[start..end];
-            slice.iter().sum::<f32>() / slice.len() as f32
+            // `np.mean` under numba, not a plain left-to-right sum — see
+            // `crate::dropout::numba_fastmath_sum`.
+            mean(&data_in[start..end])
         })
         .collect()
 }
@@ -198,17 +199,24 @@ fn interpolate_boundaries(audio: &[f32], boundaries: &[(isize, isize)]) -> Vec<f
         }
 
         let (start, end) = (start as usize, end as usize);
-        let left_knot = if start > 0 { Some((start - 1, audio[start - 1] as f64)) } else { None };
-        let right_knot = if end < audio.len() { Some((end, audio[end] as f64)) } else { None };
+        // Knot values stay `f32` here rather than being widened up front:
+        // `scipy.interpolate.interp1d` is built over a float32 `y`, so it
+        // forms `y_hi - y_lo` in float32 and only reaches float64 when
+        // dividing by the (float64) `x` spacing. It also groups the
+        // arithmetic as `slope * (x - x_lo) + y_lo`, not
+        // `y_lo + (y_hi - y_lo) * t` — same value in exact arithmetic,
+        // different rounding.
+        let left_knot = if start > 0 { Some((start - 1, audio[start - 1])) } else { None };
+        let right_knot = if end < audio.len() { Some((end, audio[end])) } else { None };
 
         for i in start..end {
             let value = match (left_knot, right_knot) {
                 (Some((lx, ly)), Some((rx, ry))) => {
-                    let t = (i as f64 - lx as f64) / (rx as f64 - lx as f64);
-                    ly + (ry - ly) * t
+                    let slope = (ry - ly) as f64 / (rx as f64 - lx as f64);
+                    slope * (i as f64 - lx as f64) + ly as f64
                 }
-                (Some((_, ly)), None) => ly,
-                (None, Some((_, ry))) => ry,
+                (Some((_, ly)), None) => ly as f64,
+                (None, Some((_, ry))) => ry as f64,
                 (None, None) => audio[i] as f64,
             };
             out[i] = value as f32;

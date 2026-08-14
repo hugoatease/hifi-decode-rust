@@ -1,27 +1,34 @@
-//! Sample-rate conversion. Ports the role of Python's `soxr.ResampleStream`
-//! (`HiFiDecode.py:1139-1143`) using `rubato` instead — chosen over an FFI
-//! binding to libsoxr specifically to keep the workspace free of native
-//! dependencies (see the hifi-decode port plan). This is **not** a
-//! bit-parity replacement: rubato's windowed-sinc resampler does not
-//! reproduce soxr's output sample-for-sample, so validation is by
-//! frequency response, not fixture equality.
+//! Sample-rate conversion. Ports Python's `soxr.ResampleStream`
+//! (`HiFiDecode.py:1139-1143`) by binding the same C library it does — see
+//! `crate::soxr` for why a pure-Rust resampler can't stand in here if the
+//! goal is byte-identical output.
 //!
 //! Matches Python's per-block usage exactly in one respect that matters a
 //! lot for correctness: `resample_chunk(audio, True)` immediately followed
 //! by `.clear()` (`HiFiDecode.py:2195-2196`, `:2229-2230`) means **no
 //! resampler state survives across blocks** — each call is independently
 //! flushed, and it's block overlap (not resampler continuity) that hides
-//! the resulting edge transients. `BlockResampler::resample` mirrors this:
-//! it builds a fresh `rubato` resampler per call rather than keeping one
-//! alive across calls.
+//! the resulting edge transients.
 
-use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction};
+use crate::soxr::{exact_ratio_pair, resample_chunk, SoxrRecipe};
 
-/// Mirrors `--resampler_quality` (`HiFiDecode.py:1126-1137`). Python maps
-/// this to soxr presets (VHQ/HQ/MQ/LQ); there's no equivalent preset table
-/// in rubato, so this picks `sinc_len`/`oversampling_factor` pairs that
-/// trade the same speed/quality axis, documented here rather than assumed
-/// perceptually equivalent to soxr's.
+/// Which link of the decode chain a resampler sits in. Python picks a
+/// *different* soxr recipe per stage once the quality preset drops below
+/// `high` (`HiFiDecode.py:1126-1137`), so the stage has to travel with the
+/// quality setting rather than being folded into it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResamplerStage {
+    /// RF -> IF. Unused by the quadrature path (which never resamples RF),
+    /// kept so the mapping table stays a faithful copy of Python's.
+    If,
+    /// Demodulated audio -> 192kHz intermediate rate.
+    Audio,
+    /// 192kHz intermediate -> the user's final output rate.
+    AudioFinal,
+}
+
+/// Mirrors `--resampler_quality` (`HiFiDecode.py:1126-1137`) and its
+/// per-stage expansion into soxr recipes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResamplerQuality {
     High,
@@ -30,60 +37,49 @@ pub enum ResamplerQuality {
 }
 
 impl ResamplerQuality {
-    fn sinc_params(self) -> SincInterpolationParameters {
-        let (sinc_len, oversampling_factor) = match self {
-            ResamplerQuality::High => (256, 256),
-            ResamplerQuality::Medium => (128, 128),
-            ResamplerQuality::Low => (64, 64),
-        };
-        SincInterpolationParameters {
-            sinc_len,
-            f_cutoff: 0.95,
-            interpolation: SincInterpolationType::Linear,
-            oversampling_factor,
-            window: WindowFunction::BlackmanHarris2,
+    fn recipe(self, stage: ResamplerStage) -> SoxrRecipe {
+        match (self, stage) {
+            (ResamplerQuality::High, _) => SoxrRecipe::Vhq,
+            (ResamplerQuality::Medium, ResamplerStage::If) => SoxrRecipe::Lq,
+            (ResamplerQuality::Medium, ResamplerStage::Audio) => SoxrRecipe::Mq,
+            (ResamplerQuality::Medium, ResamplerStage::AudioFinal) => SoxrRecipe::Hq,
+            (ResamplerQuality::Low, _) => SoxrRecipe::Lq,
         }
     }
 }
 
-/// One-shot block resampler: constructs a fresh `rubato::SincFixedIn` sized
-/// to the input length on every call, mirroring the Python
-/// resample-then-clear pattern described above. `input_rate`/`output_rate`
-/// need only be proportionally correct (only their ratio is used).
+/// One-shot block resampler, mirroring the resample-then-clear pattern
+/// described above. `input_rate`/`output_rate` need only be
+/// proportionally correct — only their ratio is used, and it is converted
+/// to the same exact numerator/denominator pair Python derives with
+/// `Fraction` before reaching libsoxr.
 pub struct BlockResampler {
-    ratio: f64,
-    quality: ResamplerQuality,
+    /// libsoxr's input rate: the *denominator* of Python's `Fraction`.
+    soxr_in_rate: f64,
+    /// libsoxr's output rate: the *numerator* of Python's `Fraction`.
+    soxr_out_rate: f64,
+    recipe: SoxrRecipe,
 }
 
 impl BlockResampler {
-    pub fn new(input_rate: f64, output_rate: f64, quality: ResamplerQuality) -> Self {
+    pub fn new(input_rate: f64, output_rate: f64, quality: ResamplerQuality, stage: ResamplerStage) -> Self {
         assert!(input_rate > 0.0 && output_rate > 0.0);
+        // Python builds the stream as
+        // `ResampleStream(denominator, numerator, ...)` from
+        // `Fraction(output_rate / input_rate)`, so the ratio is reduced to
+        // that exact pair *before* libsoxr sees it rather than being handed
+        // over as two rates.
+        let (numerator, denominator) = exact_ratio_pair(output_rate / input_rate);
         BlockResampler {
-            ratio: output_rate / input_rate,
-            quality,
+            soxr_in_rate: denominator,
+            soxr_out_rate: numerator,
+            recipe: quality.recipe(stage),
         }
     }
 
-    /// Resamples the whole of `input` in one call. Returns an empty vec for
-    /// empty input (rubato requires a non-zero chunk size).
+    /// Resamples the whole of `input` in one call, flushing the filter tail.
     pub fn resample(&self, input: &[f32]) -> Vec<f32> {
-        if input.is_empty() {
-            return Vec::new();
-        }
-        let mut resampler = SincFixedIn::<f32>::new(
-            self.ratio,
-            1.0,
-            self.quality.sinc_params(),
-            input.len(),
-            1, // mono, matching Python's per-channel ResampleStream instances
-        )
-        .expect("resampler construction failed");
-
-        let waveform_in = [input.to_vec()];
-        let mut out = resampler
-            .process(&waveform_in, None)
-            .expect("resample failed");
-        out.pop().expect("mono resampler returns one channel")
+        resample_chunk(input, self.soxr_in_rate, self.soxr_out_rate, self.recipe)
     }
 }
 
@@ -91,6 +87,19 @@ impl BlockResampler {
 mod tests {
     use super::*;
     use std::f64::consts::PI;
+
+    #[test]
+    fn quality_presets_match_pythons_per_stage_recipes() {
+        // `high` uses VHQ everywhere; `medium` fans out across three
+        // different recipes; `low` uses LQ everywhere.
+        for stage in [ResamplerStage::If, ResamplerStage::Audio, ResamplerStage::AudioFinal] {
+            assert_eq!(ResamplerQuality::High.recipe(stage), SoxrRecipe::Vhq);
+            assert_eq!(ResamplerQuality::Low.recipe(stage), SoxrRecipe::Lq);
+        }
+        assert_eq!(ResamplerQuality::Medium.recipe(ResamplerStage::If), SoxrRecipe::Lq);
+        assert_eq!(ResamplerQuality::Medium.recipe(ResamplerStage::Audio), SoxrRecipe::Mq);
+        assert_eq!(ResamplerQuality::Medium.recipe(ResamplerStage::AudioFinal), SoxrRecipe::Hq);
+    }
 
     #[test]
     fn downsamples_a_tone_preserving_its_frequency() {
@@ -103,7 +112,7 @@ mod tests {
             .map(|i| (2.0 * PI * tone_hz * i as f64 / fs_in).sin() as f32)
             .collect();
 
-        let resampler = BlockResampler::new(fs_in, fs_out, ResamplerQuality::High);
+        let resampler = BlockResampler::new(fs_in, fs_out, ResamplerQuality::High, ResamplerStage::AudioFinal);
         let output = resampler.resample(&input);
 
         // Ratio 1:4, so output should be close to n/4 samples.
@@ -114,7 +123,7 @@ mod tests {
             output.len()
         );
 
-        // Goertzel at 1kHz should dominate over a a nearby off-tone bin,
+        // Goertzel at 1kHz should dominate over a nearby off-tone bin,
         // skipping the filter's startup transient at the very start.
         let usable = &output[200..output.len() - 1];
         let goertzel = |freq: f64| -> f64 {

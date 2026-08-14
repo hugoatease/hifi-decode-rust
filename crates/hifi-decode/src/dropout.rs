@@ -8,6 +8,50 @@ use realfft::{RealFftPlanner, RealToComplex};
 
 use crate::stereo::DecodeMode;
 
+/// The `f32` sum `numba` produces for `np.mean` under `fastmath=True`.
+///
+/// Summation order changes the result, and the reference is not a plain
+/// left-to-right loop: `fastmath` lets LLVM reassociate, and it vectorises
+/// the reduction into **four** NEON `f32x4` accumulators (16 values in
+/// flight), folds those four together as a balanced tree, reduces the four
+/// lanes as another balanced tree, and finishes the ragged tail
+/// sequentially. Summing in `f64` instead — the obvious "more accurate"
+/// choice, and what this port did before — lands one ULP away, which is
+/// enough to shift output samples by an LSB.
+///
+/// This shape was recovered by searching reduction orders against DC
+/// values `HiFiDecode.cancelDC_trim` actually produced, and it is
+/// **aarch64-specific**: the same `numba` on x86-64 vectorises to a
+/// different width, so the reference's own output differs by an ULP across
+/// architectures. Bit-exactness is therefore only meaningful against a
+/// reference run on the same architecture.
+fn numba_fastmath_sum(values: &[f32]) -> f32 {
+    const LANES: usize = 4;
+    const ACCUMULATORS: usize = 4;
+    const STEP: usize = LANES * ACCUMULATORS;
+
+    let mut acc = [[0.0f32; LANES]; ACCUMULATORS];
+    let vectorized = values.len() - values.len() % STEP;
+    for chunk in values[..vectorized].chunks_exact(STEP) {
+        for (a, part) in acc.iter_mut().zip(chunk.chunks_exact(LANES)) {
+            for (slot, &value) in a.iter_mut().zip(part) {
+                *slot += value;
+            }
+        }
+    }
+
+    let mut folded = [0.0f32; LANES];
+    for lane in 0..LANES {
+        folded[lane] = (acc[0][lane] + acc[1][lane]) + (acc[2][lane] + acc[3][lane]);
+    }
+    let mut total = (folded[0] + folded[1]) + (folded[2] + folded[3]);
+
+    for &value in &values[vectorized..] {
+        total += value;
+    }
+    total
+}
+
 /// `cancelDC_trim` (`HiFiDecode.py:1857-1869`): subtract the mean over
 /// `[trim, len-trim)` from that same range in place, and zero the `trim`
 /// samples on each edge. Returns the DC value subtracted (feeds
@@ -17,8 +61,7 @@ pub fn cancel_dc_trim(audio: &mut [f32], trim: usize) -> f32 {
     assert!(trim * 2 < n, "trim window covers the whole buffer");
 
     let inner = &audio[trim..n - trim];
-    let dc = inner.iter().map(|&v| v as f64).sum::<f64>() / inner.len() as f64;
-    let dc = dc as f32;
+    let dc = numba_fastmath_sum(inner) / inner.len() as f32;
 
     for sample in &mut audio[trim..n - trim] {
         *sample -= dc;
@@ -188,8 +231,11 @@ fn check_other_channel(
     result
 }
 
-fn mean(values: &[f32]) -> f32 {
-    values.iter().sum::<f32>() / values.len() as f32
+/// `np.mean` as `numba` computes it on a `float32` array: an `f32` result,
+/// summed in `fastmath`'s reassociated order rather than left to right.
+/// See `numba_fastmath_sum`.
+pub(crate) fn mean(values: &[f32]) -> f32 {
+    numba_fastmath_sum(values) / values.len() as f32
 }
 
 /// `_fill` (`HiFiDecode.py:1945-2038`): crossfades `outer[start..end]` with
@@ -222,32 +268,44 @@ fn fill(start: usize, end: usize, outer: &mut [f32], inner: Option<&[f32]>, fade
 
     let dc_inner = if mute { 0.0 } else { mean(&inner.expect("inner required when not muting")[fade_start..fade_end]) };
 
+    // The raised-cosine ramp is computed in `f64` and only rounded on
+    // store: Python's `denom` is a Python float, so `i / denom`, the
+    // cosine and the `delta * smooth` product are all float64 there, with
+    // a single rounding when the result lands in the float32 array
+    // (`HiFiDecode.py:1992-2001`). Doing it in f32 throughout rounds at
+    // every step instead and costs an LSB across the whole ramp.
     let dc_total_len = fade_end - fade_start;
     let mut dc_interp_full = vec![0.0f32; dc_total_len];
     if dc_total_len > 1 {
-        let denom = (dc_total_len - 1) as f32;
-        let delta = dc_after - dc_before;
+        let denom = (dc_total_len - 1) as f64;
+        let delta = (dc_after - dc_before) as f64;
         for (i, slot) in dc_interp_full.iter_mut().enumerate() {
-            let t = i as f32 / denom;
-            let smooth = 0.5 * (1.0 - (std::f32::consts::PI * t).cos());
-            *slot = dc_before + delta * smooth;
+            let t = i as f64 / denom;
+            let smooth = 0.5 * (1.0 - (std::f64::consts::PI * t).cos());
+            *slot = (dc_before as f64 + delta * smooth) as f32;
         }
     } else if dc_total_len == 1 {
         dc_interp_full[0] = dc_before;
     }
 
+    // Both crossfades run in `f64` with a single rounding on store, for
+    // the same reason as the ramp above: Python's fade factors are
+    // `int / int`, which is float64, so every product and the final sum
+    // are float64 there. The bracketed inner expression stays `f32`
+    // though — all three of its terms are float32 on that side.
     for i in 0..fade_start_duration {
         let idx = fade_start + i;
         let dc_idx = idx - fade_start;
-        let fade_in_factor = i as f32 / fade_start_duration as f32;
+        let fade_in_factor = i as f64 / fade_start_duration as f64;
         let fade_out_factor = 1.0 - fade_in_factor;
-        let outer_sample = outer[idx] * fade_out_factor;
+        let outer_sample = outer[idx] as f64 * fade_out_factor;
         let inner_sample = (if mute {
             epsilon
         } else {
             inner.unwrap()[idx] - dc_inner + dc_interp_full[dc_idx]
-        }) * fade_in_factor;
-        outer[idx] = outer_sample + inner_sample;
+        }) as f64
+            * fade_in_factor;
+        outer[idx] = (outer_sample + inner_sample) as f32;
     }
 
     for i in start..end {
@@ -259,15 +317,16 @@ fn fill(start: usize, end: usize, outer: &mut [f32], inner: Option<&[f32]>, fade
     for i in 0..fade_end_duration {
         let idx = end + i;
         let dc_idx = idx - fade_start;
-        let fade_in_factor = (i + 1) as f32 / fade_end_duration as f32;
+        let fade_in_factor = (i + 1) as f64 / fade_end_duration as f64;
         let fade_out_factor = 1.0 - fade_in_factor;
-        let outer_sample = outer[idx] * fade_in_factor;
+        let outer_sample = outer[idx] as f64 * fade_in_factor;
         let inner_sample = (if mute {
             epsilon
         } else {
             inner.unwrap()[idx] - dc_inner + dc_interp_full[dc_idx]
-        }) * fade_out_factor;
-        outer[idx] = outer_sample + inner_sample;
+        }) as f64
+            * fade_out_factor;
+        outer[idx] = (outer_sample + inner_sample) as f32;
     }
 }
 

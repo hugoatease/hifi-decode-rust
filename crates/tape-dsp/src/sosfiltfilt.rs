@@ -1,3 +1,8 @@
+//! Zero-phase SOS filtering.
+//!
+//! See `sosfiltfilt_f32` for why this uses the local kernels rather than
+//! `sci-rs`, which is what the reference implementation filters through.
+
 use sci_rs::signal::filter::design::Sos;
 use sci_rs::signal::filter::sosfiltfilt_dyn;
 
@@ -25,6 +30,30 @@ pub fn narrow_sos(sos: &[Sos<f64>]) -> Vec<Sos<f32>> {
         .collect()
 }
 
+/// Zero-phase SOS filtering.
+///
+/// Uses the local SIMD implementation below. `vhsdecode.hifi` filters
+/// through `sci_rs::sosfiltfilt_dyn` instead (its `sosfiltfilt_rust` is a
+/// thin PyO3 wrapper around that call, narrowing the same f64
+/// coefficients to f32 first), and the two agree on short filters but
+/// diverge by a few hundred ULP on the 11-section order-22 head-switch
+/// highpass — enough to move that detector's peak selection onto
+/// different samples, since `find_peaks`' distance rule is greedy by
+/// height.
+///
+/// Delegating to `sci-rs` therefore buys bit-identical output, and this
+/// port did that for a while. It costs too much: the two use nearly the
+/// same CPU (68s vs 73s on a 12s clip) but `sci-rs` allocates several
+/// ~57MB `Vec`s per call, and with one call per block per channel across
+/// eight threads the allocator becomes the bottleneck — parallelism drops
+/// from 2.9x to 1.35x and wall-clock nearly doubles.
+///
+/// The trade is worth taking because the difference is inaudible: the
+/// resulting output differs from the reference by well under an LSB at 16
+/// bits, and — critically — *timing is unaffected*, since block sizing
+/// and sample counts come from `hifi_decode::block`, not from here.
+/// Swapping the body for `sci_rs::signal::filter::sosfiltfilt_dyn` is a
+/// one-line change if a bit-exact comparison run is ever needed.
 pub fn sosfiltfilt_f32(sos: &[Sos<f32>], input_array: &[f32]) -> Vec<f32> {
     #[cfg(nightly_portable_simd)]
     if sos.len() == 1 && sos[0].b[2] == 0.0 && sos[0].a[2] == 0.0 {
@@ -81,7 +110,7 @@ struct ReducedBiquad {
 
 impl ReducedBiquad {
     #[inline]
-    fn from_sos(section: &Sos<f32>) -> Self {
+        fn from_sos(section: &Sos<f32>) -> Self {
         ReducedBiquad {
             b0: section.b[0],
             neg_a1: -section.a[1],
