@@ -15,7 +15,7 @@ use core::f64::consts::PI;
 
 use nalgebra::Complex;
 use sci_rs::signal::filter::design::{
-    bilinear_zpk_dyn, lp2bp_zpk_dyn, zpk2sos_dyn, FilterBandType, Sos, ZpkFormatFilter,
+    lp2bp_zpk_dyn, zpk2sos_dyn, FilterBandType, Sos, ZpkFormatFilter,
 };
 
 /// Number of zeros a proper transfer function must gain (or, equivalently,
@@ -29,13 +29,116 @@ fn relative_degree(zeros: &[Complex<f64>], poles: &[Complex<f64>]) -> usize {
         .expect("improper transfer function: fewer poles than zeros")
 }
 
+/// A C99 `double _Complex`, laid out so it can cross the FFI boundary.
+/// On both AArch64 and x86-64 a two-`double` struct and a
+/// `double _Complex` share a calling convention, so this is ABI-compatible
+/// with the libm entry points below.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CComplex {
+    re: f64,
+    im: f64,
+}
+
+extern "C" {
+    fn csinh(z: CComplex) -> CComplex;
+}
+
+/// `sinh` of a complex number, via the platform's libm rather than
+/// `num_complex`.
+///
+/// This is not gratuitous. `num_complex::Complex::sinh` evaluates
+/// `sinh(re)cos(im) + i*cosh(re)sin(im)` directly, while numpy defers to
+/// C99 `csinh`, whose argument reduction rounds differently — the two
+/// disagree in the last bit or two. That would be unremarkable except
+/// that `cheb2ap`'s poles run through it, and the resulting filter
+/// coefficients feed a head-switch detector whose peak selection is
+/// greedy and therefore *chaotically* sensitive: a 1-ULP coefficient
+/// difference moves the filtered signal by ~1e-7, which is enough to flip
+/// which of several near-equal local maxima survives distance
+/// suppression, and the port then interpolates around entirely different
+/// samples than the reference does. Matching bit for bit here is what
+/// keeps that downstream selection identical.
+fn complex_sinh(z: Complex<f64>) -> Complex<f64> {
+    let out = unsafe { csinh(CComplex { re: z.re, im: z.im }) };
+    Complex::new(out.re, out.im)
+}
+
+/// Complex division as numpy performs it (`nc_quot` in `loops.c.src`):
+/// Smith's algorithm, dividing through by the larger-magnitude component
+/// before combining.
+///
+/// The `mul_add`s are not an optimisation — they are the point. numpy's
+/// loop is C, compiled with the default `-ffp-contract=on`, so clang fuses
+/// each `x + y*z` into a single FMA with no intermediate rounding. Rust
+/// never contracts on its own, so writing the expressions naturally gives
+/// an answer that is *more* accurate than the reference's and therefore
+/// wrong for parity purposes: on this filter's prototype two of the
+/// twenty-two poles come out a ULP away. `num_complex`'s own `Div` is a
+/// third formulation again. See `complex_sinh` for why one ULP here
+/// changes which samples the head-switch detector ends up interpolating.
+fn complex_div(a: Complex<f64>, b: Complex<f64>) -> Complex<f64> {
+    let (abs_br, abs_bi) = (b.re.abs(), b.im.abs());
+    if abs_br >= abs_bi {
+        if abs_br == 0.0 && abs_bi == 0.0 {
+            // Division by zero: let the hardware produce the inf/nan.
+            return Complex::new(a.re / abs_br, a.im / abs_bi);
+        }
+        let rat = b.im / b.re;
+        let scl = 1.0 / f64::mul_add(b.im, rat, b.re);
+        Complex::new(
+            f64::mul_add(a.im, rat, a.re) * scl,
+            f64::mul_add(-a.re, rat, a.im) * scl,
+        )
+    } else {
+        let rat = b.re / b.im;
+        let scl = 1.0 / f64::mul_add(b.re, rat, b.im);
+        Complex::new(
+            f64::mul_add(a.re, rat, a.im) * scl,
+            f64::mul_add(a.im, rat, -a.re) * scl,
+        )
+    }
+}
+
+/// Complex multiplication as numpy's `nc_prod` compiles to: the same
+/// textbook formula, with the trailing `+`/`-` fused into an FMA by the C
+/// compiler's default contraction. Same reasoning as `complex_div`.
+fn complex_mul(a: Complex<f64>, b: Complex<f64>) -> Complex<f64> {
+    Complex::new(
+        f64::mul_add(a.re, b.re, -(a.im * b.im)),
+        f64::mul_add(a.re, b.im, a.im * b.re),
+    )
+}
+
 /// Product of a slice of complex values, computed by explicit fold (rather
 /// than relying on `Iterator::product`, whose `Complex` impl is not
 /// guaranteed across `num-complex` versions).
 fn complex_product(values: &[Complex<f64>]) -> Complex<f64> {
     values
         .iter()
-        .fold(Complex::new(1.0, 0.0), |acc, &value| acc * value)
+        .fold(Complex::new(1.0, 0.0), |acc, &value| complex_mul(acc, value))
+}
+
+/// `scipy.signal.bilinear_zpk`: maps an analog zero-pole-gain filter to
+/// the digital domain by `s -> 2*fs*(z-1)/(z+1)`.
+///
+/// Reimplemented locally rather than reusing `sci-rs`'s `bilinear_zpk_dyn`
+/// for the same reason `lp2hp_zpk` is: the arithmetic has to go through
+/// `complex_div`/`complex_mul` above to round the way the reference does.
+fn bilinear_zpk(zpk: &ZpkFormatFilter<f64>, fs: f64) -> ZpkFormatFilter<f64> {
+    let degree = relative_degree(&zpk.z, &zpk.p);
+    let fs2 = Complex::new(2.0 * fs, 0.0);
+
+    let mut z_z: Vec<Complex<f64>> = zpk.z.iter().map(|&zi| complex_div(fs2 + zi, fs2 - zi)).collect();
+    let p_z: Vec<Complex<f64>> = zpk.p.iter().map(|&pi| complex_div(fs2 + pi, fs2 - pi)).collect();
+    // Zeros the analog filter had at infinity land on -1 (Nyquist).
+    z_z.extend((0..degree).map(|_| Complex::new(-1.0, 0.0)));
+
+    let prod_z = complex_product(&zpk.z.iter().map(|&zi| fs2 - zi).collect::<Vec<_>>());
+    let prod_p = complex_product(&zpk.p.iter().map(|&pi| fs2 - pi).collect::<Vec<_>>());
+    let k_z = zpk.k * complex_div(prod_z, prod_p).re;
+
+    ZpkFormatFilter::new(z_z, p_z, k_z)
 }
 
 /// Analog lowpass prototype (zeros, poles, gain) for an Nth-order Chebyshev
@@ -61,7 +164,7 @@ fn cheb2ap(order: usize, rs: f64) -> ZpkFormatFilter<f64> {
         .iter()
         .map(|&m| {
             let theta1 = PI * m / (2.0 * n_f);
-            -Complex::new(1.0, 0.0) / Complex::new(mu, theta1).sinh()
+            complex_div(Complex::new(-1.0, 0.0), complex_sinh(Complex::new(mu, theta1)))
         })
         .collect();
 
@@ -73,8 +176,10 @@ fn cheb2ap(order: usize, rs: f64) -> ZpkFormatFilter<f64> {
         .map(|&m| Complex::new(0.0, 1.0 / (PI * m / (2.0 * n_f)).sin()))
         .collect();
 
-    let k = (complex_product(&p.iter().map(|&pi| -pi).collect::<Vec<_>>())
-        / complex_product(&z.iter().map(|&zi| -zi).collect::<Vec<_>>()))
+    let k = complex_div(
+        complex_product(&p.iter().map(|&pi| -pi).collect::<Vec<_>>()),
+        complex_product(&z.iter().map(|&zi| -zi).collect::<Vec<_>>()),
+    )
     .re;
 
     ZpkFormatFilter::new(z, p, k)
@@ -96,13 +201,13 @@ fn cheb2ap(order: usize, rs: f64) -> ZpkFormatFilter<f64> {
 fn lp2hp_zpk(zpk: &ZpkFormatFilter<f64>, wo: f64) -> ZpkFormatFilter<f64> {
     let degree = relative_degree(&zpk.z, &zpk.p);
 
-    let mut z_hp: Vec<Complex<f64>> = zpk.z.iter().map(|&zi| Complex::new(wo, 0.0) / zi).collect();
-    let p_hp: Vec<Complex<f64>> = zpk.p.iter().map(|&pi| Complex::new(wo, 0.0) / pi).collect();
+    let mut z_hp: Vec<Complex<f64>> = zpk.z.iter().map(|&zi| complex_div(Complex::new(wo, 0.0), zi)).collect();
+    let p_hp: Vec<Complex<f64>> = zpk.p.iter().map(|&pi| complex_div(Complex::new(wo, 0.0), pi)).collect();
     z_hp.extend((0..degree).map(|_| Complex::new(0.0, 0.0)));
 
     let prod_neg_z = complex_product(&zpk.z.iter().map(|&zi| -zi).collect::<Vec<_>>());
     let prod_neg_p = complex_product(&zpk.p.iter().map(|&pi| -pi).collect::<Vec<_>>());
-    let k_hp = zpk.k * (prod_neg_z / prod_neg_p).re;
+    let k_hp = zpk.k * complex_div(prod_neg_z, prod_neg_p).re;
 
     ZpkFormatFilter::new(z_hp, p_hp, k_hp)
 }
@@ -147,7 +252,7 @@ pub fn cheby2_sos(order: usize, rs: f64, wn: &[f64], band_type: FilterBandType, 
         other => panic!("cheby2_sos does not support {other:?}; only highpass and bandpass are implemented"),
     };
 
-    let zpk = bilinear_zpk_dyn(zpk, FS_ANALOG);
+    let zpk = bilinear_zpk(&zpk, FS_ANALOG);
     zpk2sos_dyn(order, zpk, None, Some(false)).sos
 }
 
@@ -255,3 +360,4 @@ mod tests {
         );
     }
 }
+
